@@ -1,15 +1,17 @@
 package main
 
 import (
-	"github.com/Microsoft/go-winio"
+	"fmt"
 	"github.com/pkg/errors"
+	"golang.org/x/sys/windows"
 	"io/ioutil"
 	"log"
-	"net"
 	"os"
 	"os/exec"
-	"time"
+	"strconv"
 )
+
+const handleKey = "FOO_HANDLE"
 
 func main() {
 	var err error
@@ -25,71 +27,65 @@ func main() {
 	}
 }
 
-var namedPipe = `\\.\pipe\cnb_exec_d`
-
 func runParent() error {
-	log.Printf("opening pipe for writing %s\n", namedPipe)
-
-	l, err := winio.ListenPipe(namedPipe, nil)
+	fh, err := windows.Open(`CON`, os.O_WRONLY, 0644)
 	if err != nil {
-		return errors.Wrapf(err, "failed to create stdin pipe %s", namedPipe)
+		return errors.Wrap(err, "open file handle")
 	}
-	defer func(l net.Listener) {
-		log.Printf("deferred closing of pipe %s\n", namedPipe)
-		if err != nil {
-			l.Close()
-		}
-	}(l)
+	defer windows.Close(fh)
+	val := fmt.Sprintf("%d", fh)
+	fmt.Println("VAL", val)
 
-	go func() {
-		log.Printf("listening on pipe %s\n", namedPipe)
-		c, err := l.Accept()
-		if err != nil {
-			log.Printf("failed to accept stdin connection on %s\n", namedPipe)
-			return
-		}
+	f := os.NewFile(uintptr(fh), "foo")
+	if f == nil {
+		return errors.New("open file from handle")
+	}
+	defer f.Close()
 
-		body, err := ioutil.ReadAll(c)
-		if err != nil {
-			log.Printf("failed to read %s\n", namedPipe)
-			return
-		}
-
-		// print out child's pipe message to parent's stdout
-		log.Printf("pipe content %s\n", string(body))
-
-		c.Close()
-		l.Close()
-	}()
-
-	log.Printf("running child subprocess %s\n", namedPipe)
-	cmd := exec.Command(os.Args[0], "child")
-	// attach stdout/err so child log debug messages show up
-	// NOTE: actual pipe messages won't be logged as "child"
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
+	if _, err := fmt.Fprintf(f, "PARENT test\n"); err != nil {
 		return err
 	}
-	time.Sleep(1 * time.Second)
+
+	cmd := exec.Command(os.Args[0], "child")
+	// discard stout/stderr. only messages come from writes to parsed handle
+	cmd.Stdout = ioutil.Discard
+	cmd.Stderr = ioutil.Discard
+	cmd.Env = append(os.Environ(), fmt.Sprintf("%s=%s", handleKey, val))
+
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+
+	if _, err := fmt.Fprintf(f, "PARENT after\n"); err != nil {
+		return err
+	}
+
 
 	return nil
 }
 
 func runChild() error {
-	log.Printf("dialing pipe %s\n", namedPipe)
-	d, err := winio.DialPipe(namedPipe, nil)
+	val := os.Getenv(handleKey)
+	if val == "" {
+		return fmt.Errorf("getting handle value for %s", handleKey)
+	}
+
+	fhi, err := strconv.Atoi(val)
 	if err != nil {
-		return errors.Wrapf(err, "failed to open pipe for writing %s", namedPipe)
+		return fmt.Errorf("parsing handle value %d", fhi)
 	}
 
-	log.Printf("writing message to pipe %s\n", namedPipe)
-	if _, err = d.Write([]byte("Hello World")); err != nil {
-		return errors.Wrapf(err, "failed to write to pipe %s", namedPipe)
+	f := os.NewFile(uintptr(windows.Handle(fhi)), "foo")
+	if f == nil {
+		return errors.New("open file from handle")
 	}
+	defer f.Close()
 
-	if err = d.Close(); err != nil {
-		return errors.Wrapf(err, "failed to close dialer for pipe %s", namedPipe)
+	if _, err := fmt.Fprintf(f, "CHILD test\n"); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(os.Stdout, "STDOUT test\n"); err != nil {
+		return err
 	}
 
 	return nil
